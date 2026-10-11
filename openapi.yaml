@@ -1,0 +1,252 @@
+openapi: 3.0.3
+info:
+  title: 交通流量预测与可解释性分析 API
+  description: |
+    前端（Vue 3 + ECharts）与后端（FastAPI）之间的接口契约。
+
+    约定：
+    - 所有接口均为 POST，请求与响应均为 application/json。
+    - 错误响应推荐使用 `{ "message": "..." }`；前端同时兼容 FastAPI 默认的 `{ "detail": "..." }`。
+    - `times` / `actual` / `predict` / `lower` / `upper` 长度必须一致；
+      无值的点用 `null` 表示。
+    - `boundaryIndex`（预测起点）由前端自行推导，**后端不需要返回**。
+  version: 1.0.0
+
+servers:
+  - url: http://127.0.0.1:8000
+    description: 本地开发
+
+tags:
+  - name: predict
+  - name: explain
+  - name: agent
+
+paths:
+  /api/predict:
+    post:
+      tags: [predict]
+      summary: 交通流量预测
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueryRequest' }
+      responses:
+        '200':
+          description: 预测结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PredictionResponse' }
+        '422':
+          description: 参数校验失败
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/explain:
+    post:
+      tags: [explain]
+      summary: 可解释性分析（因子归因 + 自然语言解释）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueryRequest' }
+      responses:
+        '200':
+          description: 解释结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExplanationResponse' }
+
+  /api/agent:
+    post:
+      tags: [agent]
+      summary: LLM Agent 意图解析
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command:
+                  type: string
+                  example: 预测未来2小时 R05 区域交通流量并解释原因
+      responses:
+        '200':
+          description: 解析结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentResponse' }
+
+components:
+  schemas:
+    QueryRequest:
+      type: object
+      required: [dataset, region]
+      properties:
+        dataset: { type: string, enum: [PeMS04, PeMS08, NYC-taxi], example: PeMS08 }
+        region:  { type: string, example: R05 }
+        history: { type: integer, default: 24, description: 历史窗口步数 }
+        horizon: { type: integer, default: 24, description: 预测步数（24 步 × 5 分钟 = 2 小时） }
+        stepMin: { type: integer, default: 5, description: 采样间隔（分钟） }
+        scenario:
+          $ref: '#/components/schemas/Scenario'
+
+    Scenario:
+      type: object
+      description: what-if 情景；不传或全为默认值表示基准情景
+      properties:
+        weather: { type: string, enum: [sunny, cloudy, rain, snow], default: sunny }
+        holiday: { type: boolean, default: false }
+        peak:    { type: string, enum: [none, am, pm], default: none }
+
+    ErrorResponse:
+      type: object
+      properties:
+        message: { type: string, example: 模型推理失败 }
+
+    PredictionResponse:
+      type: object
+      required: [region, dataset, times, actual, predict, lower, upper, metrics]
+      properties:
+        region:  { type: string, example: R05 }
+        dataset: { type: string, example: PeMS08 }
+        scenario: { $ref: '#/components/schemas/Scenario' }
+        times:
+          type: array
+          description: 时间轴，长度 = history + horizon
+          items: { type: string }
+          example: ['09:00', '09:05', '09:10']
+        actual:
+          type: array
+          description: 历史观测值；预测段填 null
+          items: { type: number, nullable: true }
+          example: [412, 430, null]
+        predict:
+          type: array
+          description: 预测值；历史段填 null（除衔接点）
+          items: { type: number, nullable: true }
+          example: [null, 455, 470]
+        lower:
+          type: array
+          description: 95% 置信区间下界
+          items: { type: number, nullable: true }
+        upper:
+          type: array
+          description: 95% 置信区间上界
+          items: { type: number, nullable: true }
+        baselines:
+          type: array
+          description: 对比基线（可选）
+          items:
+            type: object
+            required: [name, values]
+            properties:
+              name: { type: string, example: ARIMA }
+              values:
+                type: array
+                items: { type: number, nullable: true }
+        regionNames:
+          type: array
+          description: 热力图纵轴区域名
+          items: { type: string }
+          example: [R01, R02]
+        heatTimes:
+          type: array
+          description: 热力图横轴时间；应对齐 times 的预测段
+          items: { type: string }
+        heatData:
+          type: array
+          description: 热力图数据，每项为 [时间索引, 区域索引, 流量]
+          items:
+            type: array
+            items: { type: number }
+          example: [[0, 0, 412], [1, 0, 430]]
+        metrics:
+          $ref: '#/components/schemas/MetricSet'
+
+    MetricSet:
+      type: object
+      description: |
+        精度指标。口径：基于**历史回测段**计算
+        （模型对历史窗口的预测值 vs 真实观测值），
+        不可用未来段预测值计算（未来段无真值）。
+      properties:
+        MAE:  { type: number, nullable: true, example: 5.1 }
+        RMSE: { type: number, nullable: true, example: 7.2 }
+        MAPE: { type: number, nullable: true, example: 6.0 }
+        R2:   { type: number, nullable: true, example: 0.95 }
+
+    FactorItem:
+      type: object
+      required: [key, name, weight]
+      properties:
+        key:
+          type: string
+          enum: [temporal, spatial, weather, trend, other]
+          description: 固定四类（other 用于后端额外提供的因子）
+        name:   { type: string, example: 时间周期（早晚高峰） }
+        weight: { type: number, description: 权重，四类之和应为 1, example: 0.36 }
+
+    ExplanationResponse:
+      type: object
+      required: [factors, explanation]
+      properties:
+        intent: { type: string }
+        parsed:
+          type: object
+          properties:
+            task:        { type: string }
+            region:      { type: string }
+            horizon:     { type: string, example: 未来 2 小时 }
+            needExplain: { type: boolean }
+            dataset:     { type: string }
+        mainFactors:
+          type: array
+          description: Top-2 主要影响因子；不返回时前端自动取权重前二
+          items: { $ref: '#/components/schemas/FactorItem' }
+        factors:
+          type: array
+          description: 四类因子及权重（缺失类别前端补 0，权重和不为 1 时前端归一化）
+          items: { $ref: '#/components/schemas/FactorItem' }
+        attention:
+          type: array
+          description: 区域 × 区域空间注意力矩阵
+          items:
+            type: array
+            items: { type: number }
+          example: [[0, 0, 1], [1, 0, 0.62]]
+        regionNames:
+          type: array
+          items: { type: string }
+        explanation: { type: string, description: 自然语言解释 }
+        reasoning:
+          type: array
+          description: 推理过程摘要（对应界面上的 Chain-of-Thought 折叠面板）
+          items: { type: string }
+
+    AgentResponse:
+      type: object
+      properties:
+        region:      { type: string, example: R05 }
+        dataset:     { type: string, example: PeMS08 }
+        horizon:     { type: integer, example: 24 }
+        scenario:    { $ref: '#/components/schemas/Scenario' }
+        needExplain: { type: boolean }
+        intent:      { type: string }
+        tools:
+          type: array
+          description: 本次调用到的工具名
+          items: { type: string }
+          example: [predict_traffic, explain_attribution]
+        plan:
+          type: array
+          description: 执行步骤，供界面展示 Agent 决策过程
+          items:
+            type: object
+            properties:
+              step:   { type: string, example: 意图解析 }
+              detail: { type: string, example: 识别为交通流量预测任务 }
